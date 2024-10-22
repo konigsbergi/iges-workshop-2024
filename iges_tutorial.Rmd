@@ -1,0 +1,884 @@
+---
+title: "IGES Educational Workshop Tutorial: Constructing & Evaluating PRS"
+author: "Maizy Brasher, Chris Arehart, Meng Lin, & Iain Konigsberg"
+date: 'Updated: `r Sys.Date()`'
+output: 
+  rmarkdown::html_document:
+    code_folding: show
+    toc: true
+    toc_float: 
+      collapsed: false
+    df_print: paged
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+# Set up environment
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set working directory to folder containing .Rmd
+setwd("~")
+```
+
+This RMarkdown document contains code demonstrating how to: 
+1. generate polygenic risk scores (PRS) through clumping & thresholding (C+T).   
+2. Calculate and evaluate existing PRS. 
+
+> C+T code in Part I is adapted from the excellent [tutorial from bigsnpr author Florian Prive](https://privefl.github.io/bigsnpr/articles/SCT.html)
+
+***
+
+# Requirements for Tutorial
+
+This tutorial relies on R packages (aside from one optional section). 
+
+## R/RStudio
+
+R can be downloaded for [Windows](https://cran.r-project.org/bin/windows/base/), [Mac](https://cran.r-project.org/bin/macosx/), and [Linux](https://cran.r-project.org/). 
+
+[RStudio](https://posit.co/download/rstudio-desktop/) is also available for these platforms. Users may want to download RStudio in addition to R because it provides a user-friendly integrated development environment (IDE) with features like syntax highlighting, project management, and advanced visualization tools.
+
+## R Packages
+
+R is an open-source programming language, meaning its source code is freely available for anyone to use and modify. This openness has led to a rich ecosystem of R packages—collections of functions, data, and documentation that extend R's capabilities for tasks like genomics analysis, data visualization, and machine learning. Users can install and load these packages from repositories like CRAN (Comprehensive R Archive Network) to enhance R's functionality.
+
+***
+
+# Part I: Generating PRS Weights from GWAS Data
+
+#### Goal: 
+
+Use GWAS summary statistics to calculate PRS for individuals in a 1000 Genomes sample. 
+
+## Input Files
+
+Summary statistics were downloaded from the [GIANT consortium]( https://portals.broadinstitute.org/collaboration/giant/index.php/GIANT_consortium_data_files). 
+
+1000 Genomes Project sample information was obtained from the [1000 Genomes Portal](https://www.internationalgenome.org/data-portal/sample) 
+
+1000 Genomes Project genotypes were obtained from the [1000 Genomes FTP site](https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/). Genotypes were subset to common chromosome 9 variants present in the summary statistics file.  
+
+> Uncomment the lines below if any R packages are not installed:
+
+```{r libraries, message=F}
+# Install required packages
+
+#install.packages("data.table")
+#install.packages("bigsnpr")
+#install.packages("devtools")
+#devtools::install_github("kaustubhad/fastman")
+#install.packages("dplyr")
+#install.packages("tidyr")
+#install.packages("ggplot2")
+#install.packages("ggpubr")
+#install.packages("GGally")
+#install.packages("pROC")
+
+
+
+# Load required libraries
+
+library(data.table) #fast file i/o
+library(bigsnpr) #genetic data & PRS construction
+library(fastman) #fast manhattan plotting
+library(dplyr) #data frame manipulation
+library(tidyr) #data frame manipulation
+library(ggplot2) #plotting
+library(ggpubr) #adding statistics to plots
+library(GGally) #pairwise plotting
+library(pROC) #auc calculation
+
+# Set ggplot2 theme for cleaner plots
+theme_set(theme_bw())
+```
+
+***
+
+### Summary Statistics
+
+Here, we load the summary statistics from the GIANT study and focus on chromosome 9. A Manhattan plot is generated to visualize the variant p-values.
+
+```{r sumstats}
+# Read in GIANT summary statistics
+sumstats <- fread("GIANT_HEIGHT_YENGO_2022_GWAS_SUMMARY_STATS_EUR", data.table = FALSE)
+
+# View the first few rows
+head(sumstats)
+
+# Subset to chromosome 9
+sumstats <- sumstats[sumstats$CHR == 9, ]
+
+# Convert p-values to numeric for plotting
+sumstats$P <- as.numeric(sumstats$P)
+
+# Manhattan plot of chromosome 9 summary statistics
+fastman_gg(sumstats, bp = "POS", maxP = 20, suggestiveline = NA, genomewideline = NA, col = "greys") +
+  geom_hline(yintercept = -log10(5e-8), color = "blue", linewidth = 1) +   # Genome-wide significance threshold
+  geom_hline(yintercept = -log10(1e-5), color = "blue", linewidth = 1) +    # Suggestive significance threshold
+  geom_hline(yintercept = -log10(1), color = "blue", linewidth = 1) 
+
+# Summary statistics overview
+cat("Total variants: ", nrow(sumstats))
+cat("Variants with p <= 1e-5: ", nrow(sumstats[sumstats$P <= 1e-5, ]))
+cat("Variants with p <= 5e-8: ", nrow(sumstats[sumstats$P <= 5e-8, ]))
+```
+
+
+***
+
+### 1000 Genomes Samples
+
+We now load and inspect the sample information from the 1000 Genomes Project.
+
+```{r tgp}
+# Load 1000 Genomes sample information
+pd <- fread("all_simulated_table_v2.txt", data.table = FALSE)
+
+# Total samples and super population counts
+cat("Total samples: ", nrow(pd))
+table(pd$`Super_Population`)
+```
+
+***
+
+### Genotype Data 
+
+Next, we load the genetic data formatted for bigsnpr and inspect its structure.
+
+```{r genotypes}
+# Load bigsnpr-formatted genetic data for European and pooled samples
+eur <- snp_attach("chr9_eur.rds")
+pooled <- snp_attach("chr9_pooled.rds")
+
+# Inspect the genotype data structure
+names(pooled)
+head(pooled$genotypes)[,1:10]
+head(pooled$fam)
+head(pooled$map)
+```
+
+***
+
+## Clumping & Thresholding 
+
+### Matching Genotypes w/ Sumstats
+
+In this step, we match the summary statistics and genotype data, ensuring that the variant names and effect alleles align.
+
+```{r snp-match}
+# Subset and rename columns in summary statistics
+sumstats <- sumstats %>% select(CHR, RSID, POS, EFFECT_ALLELE, OTHER_ALLELE, BETA, P)
+names(sumstats) <- c("chr", "rsid", "pos", "a0", "a1", "beta", "p")
+
+# Prepare genotype map by removing unnecessary columns
+map <- eur$map[,-(2:3)]
+names(map) <- c("chr", "pos", "a0", "a1")
+
+# Match variants between summary statistics and genotypes
+info_snp <- snp_match(sumstats, map) 
+```
+
+### Clumping
+
+We now perform LD clumping to retain independent SNPs based on their linkage disequilibrium in European 1000G samples.
+
+```{r clump}
+# Prepare variables for clumping
+info_snp$p <- as.numeric(info_snp$p)
+beta <- rep(NA, ncol(eur$genotypes))
+beta[info_snp$`_NUM_ID_`] <- info_snp$beta
+lpval <- rep(NA, ncol(eur$genotypes))
+lpval[info_snp$`_NUM_ID_`] <- -log10(info_snp$p)
+
+# Perform clumping
+clumped_snps <- snp_grid_clumping(pooled$genotypes, eur$map$chromosome, eur$map$physical.pos, lpS = lpval, exclude = which(is.na(lpval)), grid.thr.r2 = 0.1, grid.base.size = 250)
+
+# Report the number of independent SNPs
+cat("Number of independent SNPs retained: ", length(clumped_snps[[1]][[1]]))
+```
+
+
+### Thresholding
+
+In this section, we apply different p-value thresholds to generate multiple PRS.
+
+```{r threshold}
+# Generate PRS at different p-value thresholds
+prs_object <- snp_grid_PRS(pooled$genotypes, clumped_snps, beta, lpval,
+                          grid.lpS.thr = c(-log10(5e-8), -log10(1e-5), -log10(1)))
+
+# Extract scores for each threshold
+scores <- as.data.frame(prs_object[,1:3])
+scores <- as.data.frame(cbind(pooled$fam$sample.ID, scores))
+names(scores) <- c("IID", "mod_sig", "mod_sug", "mod_inf")
+
+
+# Save the scores
+write.csv(scores, "scores.csv", row.names = FALSE)
+
+# Merge scores with sample information
+res <- merge(pd, scores, by = "IID")
+```
+
+***
+
+## Visualizing Results
+
+### Correlation Between Scores
+
+We start by exploring the correlations between the PRS at different p-value thresholds.
+
+```{r cors}
+# Pairwise correlations between scores
+ggpairs(res[ , c("mod_sig", "mod_sug", "mod_inf")])
+```
+
+### Score Distributions
+
+Next, we visualize the distribution of scores by population.
+
+```{r scoredists, fig.width = 12}
+# Visualize score distributions across populations
+res %>%
+  pivot_longer(cols = c(mod_sig:mod_inf)) %>%
+  ggplot(aes(value, fill = Super_Population)) +
+    geom_density(alpha = 0.6) +
+    facet_wrap(~name, scales = "free")
+```
+
+### Performance by *p* Threshold
+
+Finally, we assess the performance of the PRS models by comparing AUC values at different thresholds.
+
+> AUCs calculated in this section do not take covariates into account, which is generally not advised. 
+
+```{r threshold-perf, message = FALSE}
+# Define p-value thresholds and calculate AUCs
+mods <- c(5e-8, 1e-5, 1)
+perfs <- c(auc(sim_pheno_dict ~ mod_sig, res), 
+           auc(sim_pheno_dict ~ mod_sug, res), 
+           auc(sim_pheno_dict ~ mod_inf, res))
+
+# Create performance dataframe and plot results
+df <- as.data.frame(cbind(mods, perfs))
+
+ggplot(df, aes(as.factor(mods), perfs)) +
+  geom_bar(stat = "identity") +
+  labs(y = "AUC", x = "p threshold")
+```
+
+### Genetic Similarity (PCs)
+
+In this section, we explore the genetic similarity of individuals by visualizing principal components (PCs) and computing the genetic distance from the European population (EUR) center. This approach allows us to assess the distribution of polygenic risk scores across populations based on their genetic similarity.
+
+```{r pca}
+# Plot PC1 vs PC2 colored by Super Population
+ggplot(res, aes(PC1, PC2, color = Super_Population)) + geom_point()
+```
+
+```{r genetic-sim, fig.width=12}
+
+# Speciyfy eigenvalues for the principal components
+vals <- c(45, 15, 6.1, 4.4, 3.9)
+
+# Weight PCs by variance explained
+res <- res %>% mutate(across(PC1:PC4, ~ . * vals[as.numeric(gsub("PC", "", cur_column()))]))
+
+# Define the median value for the first 5 PCs in the European population
+center1 <- median(res[res$Super_Population == "EUR", ]$PC1)
+center2 <- median(res[res$Super_Population == "EUR", ]$PC2)
+center3 <- median(res[res$Super_Population == "EUR", ]$PC3)
+center4 <- median(res[res$Super_Population == "EUR", ]$PC4)
+center5 <- median(res[res$Super_Population == "EUR", ]$PC5)
+
+# Calculate the genetic distance of each sample from the EUR median
+res$dist <- sqrt((res$PC1 - center1)^2 + (res$PC2 - center2)^2 + (res$PC3 - center3)^2 + (res$PC4 - center4)^2 + (res$PC5 - center5)^2)
+
+# Plot scores against genetic distance from EUR center
+res %>%
+  pivot_longer(cols = c(mod_sig:mod_inf)) %>%
+  ggplot(aes(dist, value)) +
+    geom_point(aes(color = Super_Population)) +
+    facet_wrap(~name, scales = "free") +
+    geom_smooth(method = "lm") +
+    stat_cor()
+```
+
+<hr style="border:2px solid gray">
+
+# Part II: Calculation and Evaluation of PRS
+
+#### Goal: 
+Use the PRS weights derived in Part I to calculate scores for individuals in a 1000 Genomes sample. Then evaluate and compare the performance of multiple scores across diverse ancestry groups.
+
+#### Requirements for this tutorial:
+
+1.  Download [workshop materials](https://github.com/konigsbergi/iges-workshop-2024) 
+    * genotype data files
+    * phenotype data file (phenotype, populations, scores, and covariates)
+    
+2. PRS weights from session 1
+
+3. (Optional) Terminal access for running ESCALATOR pipeline
+
+#### Description of provided files:
+* genetic file names (only needed for optional PRS calculation) = chr9_all_1000g.tar.gz: Due to the file size limit, you may download from the Onedrive location [here](https://olucdenver-my.sharepoint.com/:u:/g/personal/meng_lin_cuanschutz_edu/EVv7beNqc3lBgK-ajNoXBZkBAGDB0VEyrZhlUHzZJZ601Q) (compressed [PLINK2 binary format](https://www.cog-genomics.org/plink/2.0/input#pgen) )
+    
+* phenotype file name = all_simulated_table_v2.txt
+    * IID = unique ID for each individual
+    * Population = specific 1000 Genomes population ancestry group (ex. GBR = Great Britain)
+    * Super_Population = broader continental ancestry group (ex. EAS = East Asia)
+    * Gender = males (1) or females (2) as provided by 1000 genomes
+    * sim_age = simulated age variable for use as a covariate
+    * PC 1-5 = genetic principal components calculated from the 1000 genomes individuals
+    * sim_pheno_dict = simulated binary phenotype with cases (1) and controls (0)
+    * score 1-3 = chr9 PRS from the PRS catalog (PGS002993, PGS004213, & PGS003838) 
+    
+* scores from session 1 - scores.csv
+    * mod_sig = score calculated in session 1 using genome-wide significant threshold (5e-8)
+    * mod_sug = score calculated in session 1 using genome-wide suggestive threshold (1e-5)
+    * mod_inf = score calculated in session 1 using all SNPs (p-value threshold of 1)
+
+```{r loadlib, echo=T, results='hide', message=F, warning=F}
+# Install packages if not installed
+#install.packages("ggplot2")
+library(ggplot2) #plotting
+
+#install.packages("data.table")
+library(data.table) #file i/o
+
+#install.packages("dplyr")
+library(dplyr) #dataframe manipulation
+
+#install.packages("patchwork")
+library(patchwork) #arranging multiple plots
+
+#install.packages("pROC")
+library(pROC) #AUC calculations and plotting
+```
+
+***
+
+## PRS Calculation (Optional)
+
+In this section, we will use the containerized [ESCALATOR pipeline](https://github.com/menglin44/escalator) for score harmonization and calculation. More details and examples can be found in the GitHub repository. 
+
+### Download example data and weight file
+
+Use terminal commands to decompress the example PLINK2 file, and to download an example weight file from the [PGS Catalog](https://www.pgscatalog.org/):
+
+```{bash, eval = FALSE}
+### In the directory you plan to run the pipeline
+## decompress genetic file
+tar -xzvf chr9_all_1000g.tar.gz
+
+## download weight
+# For Linux:
+wget https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS002993/ScoringFiles/Harmonized/PGS002993_hmPOS_GRCh38.txt.gz
+
+# For macOS:
+curl -O https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS002993/ScoringFiles/Harmonized/PGS002993_hmPOS_GRCh38.txt.gz
+```
+
+### Configure ESCALATOR 
+
+For *Mac* users, make sure that [Docker Desktop](https://www.docker.com/products/docker-desktop/) is installed and running. Then pull the image with:
+
+```{r, eval = FALSE}
+docker pull mfisher126/escalator:M_macbook_v4
+```
+
+Other platform users (e.g. *Linux*) can use *singularity* image - make sure [singularity](https://docs.sylabs.io/guides/3.5/user-guide/introduction.html) is installed and works properly. Then, you can download the image manually from [here](https://olucdenver-my.sharepoint.com/:u:/g/personal/meng_lin_cuanschutz_edu/EQ8IM0p0itZHgKGqKge6JY0BVXAovZ66TpeV6waKr100DQ).
+
+
+Within the current working folder, make a sub-directory to host score outputs:
+
+```{r, eval = FALSE}
+cd [Your_Main_Working_Directory]
+mkdir output
+```
+
+> (replace *[Your_Main_Working_Directory]* above with your directory hosting the files)
+
+To run the pipeline, *Mac* users can try
+
+```{r, eval = FALSE}
+
+docker run -v /Your_Main_Working_Directory:/data \
+-it mfisher126/escalator:M_macbook_v4 \
+masterPRS_v4.sh 3 \
+/data PGS002993_hmPOS_GRCh38.txt.gz \
+/data/output/ height_chr9 \
+/data/chr9_all_1000g all_1000g \
+T NA
+```
+
+> (replace */Your_Main_Working_Directory* above with your directory hosting the files)
+
+
+Alternatively, Linux users can use the singularity image - 
+
+```{r, eval = FALSE}
+singularity exec escalator-v2.sif masterPRS_v4.sh 3 \
+/Your_Main_Working_Directory/ \
+PGS002993_hmPOS_GRCh38.txt.gz \
+/Your_Main_Working_Directory/output/ \
+height1_chr9 \
+/Your_Main_Working_direcrtory/chr9_all_1000g/ \
+all_1000g \
+T \
+NA
+```
+
+>(replace */Your_Main_Working_Directory* above with your directory hosting the files)
+
+
+> **Note**: We are only using chromosome 9 for an example run. In reality, you can have complete genetic data of all autosomes parsed into each chromosome per file, named with prefixes as *chr\*_all_1000g* , the command above still works and will automatically search for each chromosome.
+    
+> For complete information on the pipeline usage and explanations, please refer to [this page](https://github.com/menglin44/escalator).
+  
+    
+When finished, you'll see summary information on the screen like this:
+![image (9)](https://hackmd.io/_uploads/BJHH4c0Jyg.png)
+
+    
+Inside the ~output folder, you expect to see an output file named *height1_chr9_prs.sscore* , which would be the calculated score. 
+
+---
+
+## PRS Evaluation
+
+Now that the PRS weights and calculated scores are ready, we will evaluate them.
+
+### Read in Phenotype and Scores
+
+```{r}
+# Load phenotype data
+data <- fread("all_simulated_table_v2.txt", data.table = FALSE)
+head(data)
+str(data)
+
+# Load scores from session 1
+scores_new <- fread("scores.csv", data.table = FALSE)
+head(scores_new)
+str(scores_new)
+
+# Merge phenotype and scores
+full <- inner_join(data, select(scores_new, all_of(c("IID", "mod_sig", "mod_sug", "mod_inf"))), by = "IID")
+colnames(full)[match(c("mod_sig", "mod_sug", "mod_inf"), colnames(full))] <- c("score_sig", "score_sug", "score_inf")
+```
+
+### Visualize PRS Distributions
+
+Now we will plot each PRS by simulated phenotype case/control status. 
+
+```{r fig.width = 20, fig.height = 10}
+# Create list for plots
+plot_list <- list()
+scores <- colnames(select(full, contains("score")))
+
+# Plot score distributions between cases and controls
+for (score_col in scores) {
+  
+  # Create the violin plot
+  p <- full %>%
+    ggplot(aes(x = as.factor(sim_pheno_dict), y = .data[[score_col]], fill = as.factor(sim_pheno_dict))) +
+    geom_violin(trim = FALSE, width = 1) +
+    geom_boxplot(width = 0.1, color = "black", alpha = 0.5) +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 11)
+    ) +
+    xlab("Simulated Phenotype Value") + 
+    scale_x_discrete(labels = c("Cases", "Controls")) +
+    stat_summary(fun = median, geom = "text", aes(label = round(after_stat(y), 2)),
+                 vjust = -1, size = 3, color = "black")  # Add median text
+  
+  # Save to the list
+  plot_list[[score_col]] <- p
+}
+
+# organize the plots
+combined_plot <- (plot_list$score1 | plot_list$score2 | plot_list$score3) / (plot_list$score_sig | plot_list$score_sug | plot_list$score_inf)
+
+combined_plot
+
+# Save the plot
+ggsave("score_distributions_casecontrol.png", width = 20, height = 10)
+```
+
+### Calculate AUC and ROC Curves
+
+We calculate the AUC for a simulated binary phenotype in the EUR population and visualize the ROC curves for PRS-only, covariates-only, and full models.
+
+```{r}
+# Define covariates 
+pcs <- paste("PC", 1:5, sep = "")
+covars <- c("Gender", "sim_age", pcs)
+
+# Filter to one population
+EUR_only <- filter(full, Super_Population == "EUR")
+
+# Standardize score within ancestry group
+EUR_only$stand_score1 <- as.numeric(scale(EUR_only$score1, T, T))
+
+# Calculate AUC
+# PRS and covariates
+glm_all <- glm(as.formula(paste0("sim_pheno_dict ~ stand_score1 + ", paste0(covars, collapse = " + "))), family = "binomial", data = EUR_only)
+
+# PRS only
+glm_prs <- glm(as.formula(paste0("sim_pheno_dict ~ stand_score1")), family = "binomial", data = EUR_only)
+
+# covariates only
+glm_cov <- glm(as.formula(paste0("sim_pheno_dict ~ ", paste0(covars, collapse = " + "))), family = "binomial", data = EUR_only)
+
+# Get predicted values for each model
+prdt_all <- predict(glm_all, type="response")
+prdt_prs <- predict(glm_prs, type="response")
+prdt_cov <- predict(glm_cov, type="response")
+
+# Build roc curve for each model
+roc_all <- roc(EUR_only$sim_pheno_dict, prdt_all, ci=TRUE)
+roc_prs <- roc(EUR_only$sim_pheno_dict, prdt_prs, ci=TRUE)
+roc_cov <- roc(EUR_only$sim_pheno_dict, prdt_cov, ci=TRUE)
+
+# Get AUC values and confidence intervals for each model
+auc_all <- round(as.numeric(roc_all$auc),3)
+ci_all <- round(as.numeric(roc_all$ci)[c(1,3)],3)
+auc_prs <- round(as.numeric(roc_prs$auc),3)
+ci_prs <- round(as.numeric(roc_prs$ci)[c(1,3)],3)
+auc_cov <- round(as.numeric(roc_cov$auc),3)
+ci_cov <- round(as.numeric(roc_cov$ci)[c(1,3)],3)
+```
+
+### Plot ROC Curves
+
+```{r}
+# PRS and covariates
+p_all <- ggroc(roc_all, color = "indianred", size = 1.5) +
+      ggtitle(paste0("Score 1: Full Model AUC = ", auc_all)) +
+      geom_abline(slope = 1, intercept = 1, linetype = "dashed", alpha = 0.7, color = "grey") +
+      coord_equal() 
+
+# PRS only
+p_prs <- ggroc(roc_prs, color = "steelblue", size = 1.5) +
+      ggtitle(paste0("Score 1: PRS Only AUC = ", auc_prs)) +
+      geom_abline(slope = 1, intercept = 1, linetype = "dashed", alpha = 0.7, color = "grey") +
+      coord_equal() 
+
+# covariates only
+p_cov <- ggroc(roc_cov, color = "orange", size = 1.5) +
+    ggtitle(paste0("Score 1: Covars Only AUC = ", auc_cov)) +
+      geom_abline(slope=1, intercept = 1, linetype = "dashed", alpha=0.7, color = "grey") +
+      coord_equal()
+      
+# Get confidence intervals
+ciobj_all <- ci.se(roc_all, l = 30)
+ciobj_prs <- ci.se(roc_prs, l = 30)
+ciobj_cov <- ci.se(roc_cov, l = 30)       
+
+dat.ci.all <- data.frame(x=as.numeric(rownames(ciobj_all)), 
+                               lower = ciobj_all[,1],
+                               upper = ciobj_all[,3])
+dat.ci.prs <- data.frame(x=as.numeric(rownames(ciobj_prs)), 
+                               lower = ciobj_prs[,1],
+                               upper = ciobj_prs[,3])
+      
+dat.ci.cov <- data.frame(x=as.numeric(rownames(ciobj_cov)), 
+                               lower = ciobj_cov[,1],
+                               upper = ciobj_cov[,3])
+
+# add confidence intervals to plots
+p_all <- p_all + 
+        geom_ribbon(data = dat.ci.all, aes(x = x, ymin = lower, ymax = upper), fill = "indianred", alpha = 0.2)
+
+p_prs <- p_prs + 
+        geom_ribbon(data = dat.ci.prs, aes(x = x, ymin = lower, ymax = upper), fill = "steelblue", alpha = 0.2)
+
+p_cov <- p_cov + 
+        geom_ribbon(data = dat.ci.cov, aes(x = x, ymin = lower, ymax = upper), fill = "orange", alpha = 0.2)
+
+# save final plots
+combined_plot <- p_cov + p_prs + p_all
+combined_plot
+
+ggsave("example_AUC_roc_EURscore1.png", width = 20, height = 5)
+```
+
+### Evaluate AUC Values
+
+```{r auc-eval, message=F}
+#### Evaluate all scores across all populations ####
+# Define populations
+populations <- levels(as.factor(full$Super_Population))
+
+# Define scores
+scores <- colnames(select(full, contains("score")))
+
+# Define output tables
+# Saving AUC values
+auc_vals <- data.frame(Super_Population = character())
+
+# Incremental AUC values
+inc_auc_vals <- data.frame(Super_Population = character())
+
+# Beta values (for use later)
+betas <- data.frame(Super_Population = character())
+
+# And p-values (for use later)
+p_vals <- data.frame(Super_Population = character())
+
+
+# Calculate AUC values for each score in each population
+for (pop in populations) {
+    # filter to one population
+    print(paste0("Calculating for scores in population: ", pop))
+    pop_only <- filter(full, Super_Population == pop)
+    print(paste0("Number of individuals: ", nrow(pop_only)))
+    print(paste0("Number of cases: ", nrow(filter(pop_only, sim_pheno_dict == 1))))
+    
+    # set up for outputs
+    auc_row <- list(Super_Population = pop)
+    inc_auc_row <- list(Super_Population = pop)
+    beta_row <- list(Super_Population = pop)
+    p_val_row <- list(Super_Population = pop)
+    
+    for (score in scores) {
+        # standardize scores within ancestry group
+        print(paste0("Evaluating score: ", score))
+        pop_only$stand_score <- as.numeric(scale(pop_only[[score]], T, T))
+
+        # run the models (PRS and covariates, just PRS, just covariates)
+        glm_all <- glm(as.formula(paste0("sim_pheno_dict ~ stand_score + ", paste0(covars, collapse = " + "))), family = "binomial", data = pop_only)
+        glm_prs <- glm(as.formula(paste0("sim_pheno_dict ~ stand_score")), family = "binomial", data = pop_only)
+        glm_cov <- glm(as.formula(paste0("sim_pheno_dict ~ ", paste0(covars, collapse = " + "))), family = "binomial", data = pop_only)
+
+        # get predicted values for each model
+        prdt_all <- predict(glm_all, type="response")
+        prdt_prs <- predict(glm_prs, type="response")
+        prdt_cov <- predict(glm_cov, type="response")
+
+        # build roc curve for each model
+        roc_all <- roc(pop_only$sim_pheno_dict, prdt_all, ci=TRUE)
+        roc_prs <- roc(pop_only$sim_pheno_dict, prdt_prs, ci=TRUE)
+        roc_cov <- roc(pop_only$sim_pheno_dict, prdt_cov, ci=TRUE)
+
+        # get AUC values and confidence intervals for each model
+        auc_all <- round(as.numeric(roc_all$auc),3)
+        auc_prs <- round(as.numeric(roc_prs$auc),3)
+        auc_cov <- round(as.numeric(roc_cov$auc),3)
+        
+        # calculate incremental AUC
+        inc_auc <- auc_all - auc_cov
+        
+        # save values (for this demo only saving full model and incremental AUC)
+        auc_row[[score]] <- auc_all
+        inc_auc_row[[score]] <- round(inc_auc, 3)
+        
+        # save these for later use
+        beta_row[[score]] <- coef(summary(glm_all))[2,1]
+        p_val_row[[score]] <- coef(summary(glm_all))[2,4]
+  }
+  
+  auc_vals <- rbind(auc_vals, as.data.frame(auc_row, stringsAsFactors = FALSE))
+  inc_auc_vals <- rbind(inc_auc_vals, as.data.frame(inc_auc_row, stringsAsFactors = FALSE))
+  betas <- rbind(betas, as.data.frame(beta_row, stringsAsFactors = FALSE))
+  p_vals <- rbind(p_vals, as.data.frame(p_val_row, stringsAsFactors = FALSE))
+}
+
+# Save final tables
+auc_vals
+write.table(auc_vals, "auc_scores_per_population.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+inc_auc_vals
+write.table(inc_auc_vals, "inc_auc_scores_per_population.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+```
+
+> You may have noticed warnings during the AUC calculations, examine the output and think about what may have caused them. Did they occur for all ancestry groups? all scores?
+
+### Calculating Heterogeneity (I^2^)
+
+Calculating I^2^ values is a common method to assess heterogeneity in meta-analyses and can also be applied to capture heterogeneity between ancestry groups in PRS. 
+
+*run this chunk for useful functions*
+```{r het-funcs}
+#### Useful functions ####
+# convert beta and p-value to standard error
+beta_pval_to_se <- function(beta,pval) {
+   if(is.na(beta) | is.na(pval)){
+     return(NA)
+   }
+   
+   #turn wald test/zscore stat on its head to estimate SE
+   # find beta...
+   #OR = 10 ** LOD
+   stat = abs(qnorm(pval/2))
+   
+   # hack positive SE via abs'ing beta
+   se = abs(beta) / abs(stat)
+   if (is.na(se / 1 !=se)) {
+     se = 0 
+   }
+   
+   return(se)
+}
+
+# calculate Q from betas and p-values
+cochran_q <- function(betas, ps) {
+   if (length(betas) != length(ps)) {
+     stop("Length of p-val not matching beta")
+   }
+   
+   index.na <- which(is.na(betas) | is.na(ps))
+   
+   if(length(index.na)>0) {
+     beta <- betas[-index.na]
+     p <- ps[-index.na]
+   } else {
+     beta<-betas
+     p <- ps
+   }
+   
+   if(length(beta)<=1){ # no studies left or only 1 study for heterogeneity
+     return(NA)
+   }
+   
+   v <- mapply(beta=beta, pval=p, FUN=beta_pval_to_se)^2
+   w <- 1/v
+   beta_bar <- sum(w*beta)/sum(w)
+   Q <- sum(w*(beta-beta_bar)^2)
+   return(Q)
+}
+
+# calculate I^2 from betas and p-values
+i2 <- function(betas,ps) {
+   Q <- cochran_q(betas,ps)
+   
+   if(is.na(Q)) {
+     return(NA)
+   }
+   
+   k <- length(which(!is.na(betas)))
+
+   if ((Q - (k-1)) <0) {
+     return(0)
+   } else {
+     i2 <- (Q-(k-1))/Q
+     return(i2)
+   }
+}
+```
+
+calculate I^2^ values for each score to get a measure of heterogeneity in score performance across ancestry groups.
+
+```{r i2}
+# Set up I^2 table
+i2_het <- data.frame(Score = character(), I2 = numeric(), stringsAsFactors = FALSE)
+
+for (score in scores) {
+  # Calculate I^2
+  i2_val <- i2(betas[[score]], p_vals[[score]])
+  
+  # Save value into table
+  i2_het <- rbind(i2_het, data.frame(Score = score, I2 = i2_val))
+}
+
+# Print and write out final table
+i2_het
+write.table(i2_het, "scores_i2_vals.txt", , sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+```
+***
+
+## Discussion Break
+
+***
+
+## Ancestry Considerations
+
+### Scores by Ancestry Group
+
+For one example score, look at how score distributions vary by continental ancestry group
+
+```{r ancestry-dist}
+# Create plot
+ggplot(full, aes(x = score1, fill = Super_Population)) +
+  geom_density(alpha = 0.6) +
+  labs(title = "Score 1: Distribution Across Ancestry",
+       x = "SCORE",
+       y = "Density",
+       fill = "Continental Group")
+
+# Save plot
+ggsave("score1_1000g_bycontinent.png")
+```
+
+### Score Correlations with PCs
+
+```{r score-pc-cors}
+for (score in scores) {
+    lm <- lm(as.formula(paste0(score," ~ ", paste0(covars, collapse = " + "))), data = full)
+
+    print(paste0("Model coefficients for: ", score))
+    print(signif(summary(lm)[[4]], digits = 3))
+}
+```
+
+### Ancestry Calibration
+
+> *NOTE: the following method is similar to continuous ancestry calibration methods used by the NHGRI eMERGE Network and the PGS catalog. However, it should be used with caution as it is possible for the calibration to cancel out real genetic differences between groups that are important and informative*
+
+Because scores often show confounding by ancestry, both in terms of score distribution and performance, we generally calibrate scores by genetic ancestry group. 
+The following shows the calibration method for one score:
+```{r ancestry-calibration, fig.width=14}
+# choose a score to look at, for example - score1
+score <- "score1"
+
+# step 1 - calibrate means
+lm1 <- lm(as.formula(paste0(score," ~ ", paste0(pcs, collapse = " + "))), data = full)
+full$calibrated1 <- full[[score]] - predict(lm1)
+
+# step 2 - calibrate variances
+resid_var <- (resid(lm1)-mean(resid(lm1)))^2
+lm2 <- lm(as.formula(paste0("resid_var ~ ", paste0(pcs, collapse = " + "))), data = full)
+
+predicted_var <- predict(lm2)
+
+full$calibrated2 <- (full[[score]] - predict(lm1)) / sqrt(predicted_var)
+
+# Plot calibrated scores for comparison
+
+# Plot uncalibrated score
+p1 <- ggplot(full, aes(x = .data[[score]], fill = Super_Population)) +
+      geom_density(alpha = 0.5) +
+      labs(title = paste0("Uncalibrated score: ", score),
+           x = "SCORE",
+           y = "Density",
+           fill = "Continental Ancestry Group") +
+      theme(legend.position = "none")
+
+# Plot mean calibrated score
+p2 <- ggplot(full, aes(x = calibrated1, fill = Super_Population)) +
+      geom_density(alpha = 0.5) +
+      labs(title = paste0("Mean Calibrated score: ", score),
+           x = "SCORE",
+           y = "Density",
+           fill = "Continental Ancestry Group") +
+      theme(legend.position = "none")
+    
+# Plot mean and variance calibrated score
+p3 <- ggplot(full, aes(x = calibrated2, fill = Super_Population)) +
+      geom_density(alpha = 0.5) +
+      labs(title = paste0("Mean & Variance Calibrated score: ", score),
+           x = "SCORE",
+           y = "Density",
+           fill = "Continental Ancestry Group")
+
+# Make final combined plot for easy comparison
+combined_plot <- p1 + p2 + p3
+
+combined_plot
+
+# Save final plot
+ggsave(paste0(score, "_ancestry_distributions_all.png"), width = 20, height = 5)
+```
