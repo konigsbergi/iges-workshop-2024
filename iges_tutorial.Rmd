@@ -491,7 +491,7 @@ for (score_col in scores) {
       plot.title = element_text(size = 11)
     ) +
     xlab("Simulated Phenotype Value") + 
-    scale_x_discrete(labels = c("Cases", "Controls")) +
+    scale_x_discrete(labels = c("Controls", "Cases")) +
     stat_summary(fun = median, geom = "text", aes(label = round(after_stat(y), 2)),
                  vjust = -1, size = 3, color = "black")  # Add median text
   
@@ -607,6 +607,8 @@ ggsave("example_AUC_roc_EURscore1.png", width = 20, height = 5)
 ```
 
 ### Evaluate AUC Values
+
+We systematically evaluate AUC for all scores across all ancestry groups, as well as calculate incremental AUC. The incremental AUC can be used to isolate the explanatory power of the PRS for the binary target trait. The incremental AUC is calculated by subtracting the covariate-only model AUC from the full model AUC to assess the increase in AUC with the addition of PRS to the model.
 
 ```{r auc-eval, message=F}
 #### Evaluate all scores across all populations ####
