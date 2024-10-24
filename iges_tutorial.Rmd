@@ -309,7 +309,7 @@ res %>%
 # Part II: Calculation and Evaluation of PRS
 
 #### Goal: 
-Use the PRS weights derived in Part I to calculate scores for individuals in a 1000 Genomes sample. Then evaluate and compare the performance of multiple scores across diverse ancestry groups.
+See how to use the PRS weights derived in Part I to calculate scores for individuals in a 1000 Genomes sample. Then evaluate and compare the performance of multiple scores across diverse ancestry groups.
 
 #### Requirements for this tutorial:
 
@@ -317,7 +317,7 @@ Use the PRS weights derived in Part I to calculate scores for individuals in a 1
     * genotype data files
     * phenotype data file (phenotype, populations, scores, and covariates)
     
-2. PRS weights from session 1
+2. PRS from session 1
 
 3. (Optional) Terminal access for running ESCALATOR pipeline
 
@@ -361,7 +361,7 @@ library(pROC) #AUC calculations and plotting
 
 ## PRS Calculation (Optional)
 
-In this section, we will use the containerized [ESCALATOR pipeline](https://github.com/menglin44/escalator) for score harmonization and calculation. More details and examples can be found in the GitHub repository. 
+This section demonstrates one method for calculating PRS from weight files downloaded from the PRS catalog. In this section, we will use the containerized [ESCALATOR pipeline](https://github.com/menglin44/escalator) for score harmonization and calculation. More details and examples can be found in the GitHub repository. 
 
 ### Download example data and weight file
 
@@ -448,7 +448,7 @@ Inside the ~output folder, you expect to see an output file named *height1_chr9_
 
 ## PRS Evaluation
 
-Now that the PRS weights and calculated scores are ready, we will evaluate them.
+For the purposes of this tutorial, we have calculated PRS from three PGS catalog scores for you. We also have the three scores that were calculated in Part 1 of this tutorial. In this section, we will demonstrate some methods for evaluating and comparing scores.
 
 ### Read in Phenotype and Scores
 
@@ -792,7 +792,7 @@ write.table(i2_het, "scores_i2_vals.txt", , sep = "\t", quote = FALSE, row.names
 ```
 ***
 
-## Discussion Break
+## Discussion Break:
 
 ***
 
