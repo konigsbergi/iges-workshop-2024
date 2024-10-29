@@ -253,18 +253,34 @@ Finally, we assess the performance of the PRS models by comparing AUC values at 
 > AUCs calculated in this section do not take covariates into account, which is generally not advised. 
 
 ```{r threshold-perf, message = FALSE}
-# Define p-value thresholds and calculate AUCs
+
+# Create simulated height variable
+res$sim_height <- res$sim_pheno_quant * 4 + 168
+
+# Fit model with covariates using each score
+mod1 <- lm(sim_height ~ mod_sig + sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
+mod2 <- lm(sim_height ~ mod_sug + sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
+mod3 <- lm(sim_height ~ mod_inf + sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
+
+# Get predicted heights from models
+pred1 <- predict(mod1, res)
+pred2 <- predict(mod2, res)
+pred3 <- predict(mod3, res)
+
+
+# Define p-value thresholds and calculate r^2s
 mods <- c(5e-8, 1e-5, 1)
-perfs <- c(auc(sim_pheno_dict ~ mod_sig, res), 
-           auc(sim_pheno_dict ~ mod_sug, res), 
-           auc(sim_pheno_dict ~ mod_inf, res))
+
+perfs <- c(cor(pred1, res$sim_height)^2, 
+           cor(pred2, res$sim_height)^2, 
+           cor(pred3, res$sim_height)^2)
 
 # Create performance dataframe and plot results
 df <- as.data.frame(cbind(mods, perfs))
 
 ggplot(df, aes(as.factor(mods), perfs)) +
   geom_bar(stat = "identity") +
-  labs(y = "AUC", x = "p threshold")
+  labs(y = expression(R^2), x = "p threshold")
 ```
 
 ### Genetic Similarity (PCs)
@@ -328,10 +344,11 @@ See how to use the PRS weights derived in Part I to calculate scores for individ
     * IID = unique ID for each individual
     * Population = specific 1000 Genomes population ancestry group (ex. GBR = Great Britain)
     * Super_Population = broader continental ancestry group (ex. EAS = East Asia)
-    * Gender = males (1) or females (2) as provided by 1000 genomes
+    * sex = males (1) or females (2) as provided by 1000 genomes
     * sim_age = simulated age variable for use as a covariate
     * PC 1-5 = genetic principal components calculated from the 1000 genomes individuals
     * sim_pheno_dict = simulated binary phenotype with cases (1) and controls (0)
+    * sim_pheno_quant = simulated quantitative phenotype
     * score 1-3 = chr9 PRS from the PRS catalog (PGS002993, PGS004213, & PGS003838) 
     
 * scores from session 1 - scores.csv
@@ -515,7 +532,7 @@ We calculate the AUC for a simulated binary phenotype in the EUR population and 
 ```{r}
 # Define covariates 
 pcs <- paste("PC", 1:5, sep = "")
-covars <- c("Gender", "sim_age", pcs)
+covars <- c("sex", "sim_age", pcs)
 
 # Filter to one population
 EUR_only <- filter(full, Super_Population == "EUR")
