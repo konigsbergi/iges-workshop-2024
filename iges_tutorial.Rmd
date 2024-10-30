@@ -248,9 +248,7 @@ res %>%
 
 ### Performance by *p* Threshold
 
-Finally, we assess the performance of the PRS models by comparing AUC values at different thresholds.
-
-> AUCs calculated in this section do not take covariates into account, which is generally not advised. 
+Finally, we assess the performance of the PRS models by comparing incremental R*2* values at different thresholds.
 
 ```{r threshold-perf, message = FALSE}
 
@@ -258,29 +256,33 @@ Finally, we assess the performance of the PRS models by comparing AUC values at 
 res$sim_height <- res$sim_pheno_quant * 4 + 168
 
 # Fit model with covariates using each score
-mod1 <- lm(sim_height ~ mod_sig + sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
-mod2 <- lm(sim_height ~ mod_sug + sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
-mod3 <- lm(sim_height ~ mod_inf + sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
+mod_base <- lm(sim_height ~ sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
+mod_1 <- lm(sim_height ~ mod_sig + sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
+mod_2 <- lm(sim_height ~ mod_sug + sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
+mod_3 <- lm(sim_height ~ mod_inf + sex + sim_age + PC1 + PC2 + PC3 + PC4 + PC5, data = res)
 
-# Get predicted heights from models
-pred1 <- predict(mod1, res)
-pred2 <- predict(mod2, res)
-pred3 <- predict(mod3, res)
+# Calculate r2 of base model
+r2_base <- summary(mod_base)$r.squared
 
+# Calculate r2 of models with PRS
+r2_sig <- summary(mod_1)$r.squared
+r2_sug <- summary(mod_2)$r.squared
+r2_inf <- summary(mod_3)$r.squared
 
 # Define p-value thresholds and calculate r^2s
 mods <- c(5e-8, 1e-5, 1)
 
-perfs <- c(cor(pred1, res$sim_height)^2, 
-           cor(pred2, res$sim_height)^2, 
-           cor(pred3, res$sim_height)^2)
+# Calculate incremental R^2s
+incs <- c(r2_sig - r2_base, 
+          r2_sug - r2_base, 
+          r2_inf - r2_base)
 
 # Create performance dataframe and plot results
-df <- as.data.frame(cbind(mods, perfs))
+df <- as.data.frame(cbind(mods, incs))
 
-ggplot(df, aes(as.factor(mods), perfs)) +
+ggplot(df, aes(as.factor(mods), incs)) +
   geom_bar(stat = "identity") +
-  labs(y = expression(R^2), x = "p threshold")
+  labs(y = expression("Incremental " * R^2), x = "p threshold")
 ```
 
 ### Genetic Similarity (PCs)
